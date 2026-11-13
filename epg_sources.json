@@ -1,10 +1,8 @@
 [
-  {
-    "name": "epg.one (lite)",
-    "url": "http://epg.one/epg2.xml"
-  },
-  {
-    "name": "iptvx.one (lite)",
-    "url": "https://iptvx.one/epg/epg_lite.xml.gz"
-  }
+  { "name": "epg.one (epg2)", "url": "http://epg.one/epg2.xml" },
+  { "name": "epg.one (full gz)", "url": "https://epg.one/epg.xml.gz" },
+  { "name": "iptvx.one (lite)", "url": "https://iptvx.one/epg/epg_lite.xml.gz" },
+  { "name": "iptvx.one (full)", "url": "https://iptvx.one/epg/epg.xml.gz" },
+  { "name": "epg.pw (RU)", "url": "https://epg.pw/xmltv/epg_RU.xml.gz" },
+  { "name": "teleguide.info", "url": "http://www.teleguide.info/download/new3/xmltv.xml.gz" }
 ]
