@@ -1,0 +1,10 @@
+[
+  {
+    "name": "epg.one (lite)",
+    "url": "http://epg.one/epg2.xml"
+  },
+  {
+    "name": "iptvx.one (lite)",
+    "url": "https://iptvx.one/epg/epg_lite.xml.gz"
+  }
+]
