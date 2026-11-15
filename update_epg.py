@@ -3,6 +3,14 @@
 
 Источник каналов: playlist.m3u.txt из репозитория приложения.
 Выход: epg.xml в корне репозитория.
+
+ВАЖНО про приоритет источников:
+  epg_sources.json должен быть УПОРЯДОЧЕН по убыванию доверия.
+  Первый источник — самый надёжный (официальный сайт канала).
+  Последние — «затычки», закрывающие дыры в сетке.
+  Слоты (start..stop) занимаются программами по порядку источников:
+  если источник[0] дал программу на 10:00–11:00, то программа
+  источника[1] на 10:30 уже НЕ попадёт в epg.xml.
 """
 
 import copy
@@ -13,6 +21,7 @@ import re
 import sys
 import time
 import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
@@ -140,6 +149,38 @@ def parse_xmltv(xml_content: bytes):
 
 
 # ---------------------------------------------------------------------------
+# Время XMLTV → epoch-секунды (с учётом часового пояса)
+# ---------------------------------------------------------------------------
+
+_TIME_RE = re.compile(r"^(\d{14})(?:\s*([+-]\d{4}))?$")
+
+
+def parse_xmltv_time(s: str) -> int | None:
+    """XMLTV-время → epoch-секунды. Поддерживает 'YYYYMMDDhhmmss[ ±zzzz]'.
+
+    Без явного пояса по спецификации XMLTV подразумевается UTC.
+    """
+    if not s:
+        return None
+    m = _TIME_RE.match(s.strip())
+    if not m:
+        return None
+    try:
+        dt = datetime.strptime(m.group(1), "%Y%m%d%H%M%S")
+    except ValueError:
+        return None
+    tz_str = m.group(2)
+    if tz_str:
+        sign = 1 if tz_str[0] == "+" else -1
+        hours, minutes = int(tz_str[1:3]), int(tz_str[3:5])
+        tz = timezone(sign * timedelta(hours=hours, minutes=minutes))
+        dt = dt.replace(tzinfo=tz)
+    else:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.timestamp())
+
+
+# ---------------------------------------------------------------------------
 # Основной сценарий
 # ---------------------------------------------------------------------------
 
@@ -154,15 +195,21 @@ def main():
     playlist = parse_playlist(playlist_raw.decode("utf-8", errors="replace"))
     print(f"Каналов в плейлисте: {len(playlist)}")
 
-    # 2. Источники
+    # 2. Источники (упорядочены по убыванию приоритета)
     sources = json.loads(Path(SOURCES_FILE).read_text(encoding="utf-8"))
+    if not isinstance(sources, list) or not sources:
+        print("!!! epg_sources.json пуст или не является массивом")
+        sys.exit(1)
 
-    # final: our_id -> {"name": str, "programmes": [...]}
+    # final: our_id -> {
+    #   "name": str,
+    #   "programmes": [(priority_idx, prog_el, start_sec, stop_sec), ...]
+    # }
     final: dict[str, dict] = {}
 
-    # 3. Обрабатываем каждый источник
-    for src in sources:
-        print(f"\n--- Источник: {src['name']} ---")
+    # 3. Собираем программы из всех источников с меткой приоритета
+    for src_idx, src in enumerate(sources):
+        print(f"\n--- Источник [{src_idx}]: {src.get('name', src.get('url'))} ---")
         content = download(src["url"])
         if not content:
             continue
@@ -186,68 +233,59 @@ def main():
             if not src_id:
                 continue
 
-            if our_id not in final:
-                final[our_id] = {"name": our_name, "programmes": []}
+            final.setdefault(our_id, {"name": our_name, "programmes": []})
 
-            # ★ Берём программы из КАЖДОГО источника, а не только из первого.
             for prog in programmes_by_id.get(src_id, []):
-                final[our_id]["programmes"].append(copy.deepcopy(prog))
+                start_sec = parse_xmltv_time(prog.get("start", ""))
+                stop_sec = parse_xmltv_time(prog.get("stop", ""))
+                if start_sec is None or stop_sec is None or stop_sec <= start_sec:
+                    continue
+                final[our_id]["programmes"].append(
+                    (src_idx, copy.deepcopy(prog), start_sec, stop_sec)
+                )
 
             if mode:
                 print(f"  {our_name!r} -> {src_id!r} ({mode})")
 
-    # 4. Собираем итоговый XML
+    # 4. Сборка epg.xml с приоритетом источников и отсечением пересечений
     print("\n=== Сборка epg.xml ===")
     root = ET.Element("tv")
     root.set("generator-info-name", "Custom EPG for IPTV App")
 
-    now_ms = int(time.time() * 1000)
-    one_day_ms = 24 * 60 * 60 * 1000
+    now_sec = int(time.time())
+    one_day_sec = 24 * 60 * 60
 
     total_progs = 0
     used_ids = set()
 
     for our_id, data in sorted(final.items()):
+        # Сортируем по (приоритет источника, начало).
+        # Источник[0] обрабатывается первым → его программы занимают слоты,
+        # всё, что с ними пересекается, отбрасывается.
+        items = sorted(data["programmes"], key=lambda x: (x[0], x[2]))
+
+        kept = []
+        for priority, prog, start, stop in items:
+            if stop < now_sec - one_day_sec:
+                continue
+            # Пересечение с уже принятой программой этого канала?
+            if any(start < ks and stop > ke for _, _, ks, ke in kept):
+                continue
+            kept.append((priority, prog, start, stop))
+
+        if not kept:
+            continue
+
         ch_el = ET.SubElement(root, "channel")
         ch_el.set("id", our_id)
-        # ★ Наше имя — ПЕРВОЕ display-name, чтобы приложение точно сматчило
         dn = ET.SubElement(ch_el, "display-name")
         dn.text = data["name"]
 
-        # Дедупликация программ по (start, stop, title)
-        seen = set()
-        valid = []
-        for p in data["programmes"]:
-            start = p.get("start", "")
-            stop = p.get("stop", "")
-            title = ""
-            for child in p:
-                if strip_ns(child.tag) == "title" and child.text:
-                    title = child.text
-                    break
-            key = (start, stop, title)
-            if key in seen:
-                continue
-            seen.add(key)
-
-            # ★ Отбрасываем программы, которые уже закончились более суток назад
-            # (start в формате XMLTV — YYYYMMDDhhmmss ±zzzz)
-            try:
-                start_ms = _xmltv_to_ms(start)
-                if start_ms and start_ms < now_ms - one_day_ms:
-                    continue
-            except Exception:
-                pass
-            valid.append(p)
-
-        if not valid:
-            continue
-
-        used_ids.add(our_id)
-        for p in valid:
-            p.set("channel", our_id)
-            root.append(p)
+        for _, prog, _, _ in kept:
+            prog.set("channel", our_id)
+            root.append(prog)
             total_progs += 1
+        used_ids.add(our_id)
 
     tree = ET.ElementTree(root)
     try:
@@ -256,7 +294,7 @@ def main():
         pass
     tree.write(OUTPUT_FILE, encoding="utf-8", xml_declaration=True)
 
-    # 5. Валидация
+    # 5. Отчёт
     print("\n=== Готово ===")
     print(f"Каналов с программами: {len(used_ids)}")
     print(f"Программ: {total_progs}")
@@ -265,20 +303,6 @@ def main():
     if len(used_ids) < 5 or total_progs < 100:
         print("!!! Слишком мало данных, результат подозрительный")
         sys.exit(1)
-
-
-def _xmltv_to_ms(s: str) -> int | None:
-    """Грубое преобразование XMLTV-даты в epoch-ms (для фильтрации)."""
-    m = re.match(r"^(\d{14})", s or "")
-    if not m:
-        return None
-    raw = m.group(1)
-    try:
-        from datetime import datetime, timezone
-        dt = datetime.strptime(raw, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
-        return int(dt.timestamp() * 1000)
-    except Exception:
-        return None
 
 
 if __name__ == "__main__":
