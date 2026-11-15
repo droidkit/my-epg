@@ -93,7 +93,7 @@ def parse_playlist(text: str) -> list[dict]:
 def download(url: str) -> bytes | None:
     print(f"Скачиваем: {url}")
     try:
-        resp = requests.get(url, timeout=90, headers={"User-Agent": "Mozilla/5.0"})
+        resp = requests.get(url, timeout=180, headers={"User-Agent": "Mozilla/5.0"})
         resp.raise_for_status()
         content = resp.content
         if content[:2] == b"\x1f\x8b":
@@ -268,8 +268,9 @@ def main():
         for priority, prog, start, stop in items:
             if stop < now_sec - one_day_sec:
                 continue
-            # Пересечение с уже принятой программой этого канала?
-            if any(start < ks and stop > ke for _, _, ks, ke in kept):
+            # ★ ПРАВИЛЬНАЯ проверка пересечения интервалов [start, stop):
+            #   пересекаются ⇔ new.start < existing.stop AND new.stop > existing.start
+            if any(start < ke and stop > ks for _, _, ks, ke in kept):
                 continue
             kept.append((priority, prog, start, stop))
 
